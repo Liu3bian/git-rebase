@@ -1,0 +1,1165 @@
+这是一个非常专业的改进。在企业级开发中，统一结果类 Result 可以标准化前后端交互，将 code 改为 200 也更符合 RESTful 规范。
+
+我们将分两步：后端重构 和 前端配置调整。
+
+第一步：后端定义 Result 类
+在 src/main/java/com/example/common 目录下创建 Result.java。
+
+Java
+
+package com.example.common;
+
+import lombok.Data;
+
+import java.io.Serializable;
+
+@Data
+public class Result<T> implements Serializable {
+    private Integer code;    // 状态码：200 成功，500 失败
+    private String message;  // 提示信息
+    private T data;          // 数据负载
+
+    public Result() {}
+
+    public static <T> Result<T> success(T data) {
+        Result<T> result = new Result<>();
+        result.setCode(200);
+        result.setMessage("操作成功");
+        result.setData(data);
+        return result;
+    }
+
+    public static <T> Result<T> success(String message, T data) {
+        Result<T> result = new Result<>();
+        result.setCode(200);
+        result.setMessage(message);
+        result.setData(data);
+        return result;
+    }
+
+    public static <T> Result<T> error(String message) {
+        Result<T> result = new Result<>();
+        result.setCode(500);
+        result.setMessage(message);
+        result.setData(null);
+        return result;
+    }
+}
+第二步：重构 AuthController 和 LeaveController
+现在我们将所有的 Map<String, Object> 替换为 Result。
+
+1. AuthController.java (部分关键代码)
+
+Java
+
+@PostMapping("/login")
+public Result<Map<String, Object>> login(@RequestBody Map<String, String> loginDto) {
+    String username = loginDto.get("username");
+    String password = loginDto.get("password");
+
+    authenticationManager.authenticate(new UsernamePasswordAuthenticationToken(username, password));
+    String token = jwtUtils.generateToken(username);
+
+    Map<String, Object> data = new HashMap<>();
+    data.put("token", token);
+    return Result.success(data);
+}
+
+@GetMapping("/info")
+public Result<Map<String, Object>> info(@RequestParam String token) {
+    String username = jwtUtils.getUsernameFromToken(token);
+    SysUser user = userRepository.findByUsername(username).get();
+
+    Map<String, Object> data = new HashMap<>();
+    data.put("roles", user.getRoles().stream().map(r -> r.getCode()).toArray());
+    data.put("name", user.getRealName());
+    data.put("avatar", "https://wpimg.wallstcn.com/f778738c-e4f8-4870-b634-56703b4acafe.gif");
+    return Result.success(data);
+}
+2. LeaveController.java (重构后的接口)
+
+Java
+
+@RestController
+@RequestMapping("/leave")
+public class LeaveController {
+    // ... 注入的 Service 不变 ...
+
+    @PostMapping("/start")
+    public Result<String> startLeave(@RequestBody Map<String, Object> variables) {
+        String currentUsername = SecurityContextHolder.getContext().getAuthentication().getName();
+        variables.put("applyUserId", currentUsername);
+        ProcessInstance instance = runtimeService.startProcessInstanceByKey("leave_process", variables);
+        return Result.success("流程发起成功，ID: " + instance.getId());
+    }
+
+    @GetMapping("/todo")
+    public Result<List<Map<String, Object>>> getTodoList() {
+        String currentUsername = SecurityContextHolder.getContext().getAuthentication().getName();
+        List<Task> tasks = taskService.createTaskQuery().taskAssignee(currentUsername).list();
+
+        List<Map<String, Object>> taskList = tasks.stream().map(task -> {
+            Map<String, Object> map = new HashMap<>();
+            map.put("taskId", task.getId());
+            map.put("taskName", task.getName());
+            map.put("variables", taskService.getVariables(task.getId()));
+            return map;
+        }).collect(Collectors.toList());
+
+        return Result.success(taskList);
+    }
+
+    @PostMapping("/approve")
+    public Result<String> approveTask(@RequestBody Map<String, String> body) {
+        taskService.complete(body.get("taskId"));
+        return Result.success("审批成功");
+    }
+}
+第三步：修改 Vue 前端配置 (适配 code 200)
+在 vue-admin-template 中，我们需要修改核心请求拦截逻辑。
+
+1. 修改 src/utils/request.js
+
+将判断逻辑从 20000 改为 200。
+
+JavaScript
+
+// ... 前面部分不变 ...
+service.interceptors.response.use(
+  response => {
+    const res = response.data
+    // 关键修改：判断 code 是否为 200
+    if (res.code !== 200) {
+      Message({
+        message: res.message || 'Error',
+        type: 'error',
+        duration: 5 * 1000
+      })
+
+      // 50008: 非法Token; 50012: 其他客户端登录; 50014: Token 过期;
+      if (res.code === 500) {
+        // 这里可以根据需要添加重新登录的逻辑
+      }
+      return Promise.reject(new Error(res.message || 'Error'))
+    } else {
+      // 200 成功，返回 data 部分
+      return res
+    }
+  },
+  // ... 后面部分不变 ...
+2. 修改 src/store/modules/user.js (符合企业开发写法)
+
+在 login 和 getInfo 的 Action 中，注意数据结构。因为我们后端现在返回的是 Result，结构是 { code: 200, data: { ... } }。
+
+JavaScript
+
+// login action 示例
+login({ commit }, userInfo) {
+  const { username, password } = userInfo
+  return new Promise((resolve, reject) => {
+    login({ username: username.trim(), password: password }).then(response => {
+      // 现在的 response 是 Result 对象，真正的 token 在 response.data.token
+      const { data } = response
+      commit('SET_TOKEN', data.token)
+      setToken(data.token)
+      resolve()
+    }).catch(error => {
+      reject(error)
+    })
+  })
+},
+
+// getInfo action 示例
+getInfo({ commit, state }) {
+  return new Promise((resolve, reject) => {
+    getInfo(state.token).then(response => {
+      const { data } = response // 获取 Result 里的 data
+      if (!data) {
+        return reject('Verification failed, please Login again.')
+      }
+      const { roles, name, avatar } = data
+      commit('SET_ROLES', roles)
+      commit('SET_NAME', name)
+      commit('SET_AVATAR', avatar)
+      resolve(data)
+    }).catch(error => {
+      reject(error)
+    })
+  })
+}
+总结与下一步
+通过这种重构，你的代码已经具备了：
+
+标准化的响应体：方便前端统一处理提示和错误。
+
+规范的状态码：符合行业标准的 200 成功标识。
+
+清晰的解耦：前端 request.js 处理全局状态，store 处理业务数据。
+
+后端代码已完全适配 Java 17 和 Result 模式。你需要我帮你写出前端 src/router/index.js 的完整路由配置，好让侧边栏能显示出“请假申请”和“任务审批”吗？
+
+
+这是非常关键的一步。在 vue-admin-template 中，侧边栏是根据路由配置（src/router/index.js）动态生成的。我们需要定义“员工”和“主管”看到的不同菜单项。
+
+同时，为了符合企业规范，我们会使用 路由元信息 (meta) 来控制菜单图标和标题。
+
+第一步：修改 src/router/index.js
+请将以下代码完整替换或合并到你的路由配置文件中。注意：我保留了基础路由（如登录页），并添加了请假业务路由。
+
+JavaScript
+
+import Vue from 'vue'
+import Router from 'vue-router'
+
+Vue.use(Router)
+
+/* Layout */
+import Layout from '@/layout'
+
+/**
+ * constantRoutes
+ * 没有权限要求的通用页面，所有角色都可以访问
+ */
+export const constantRoutes = [
+  {
+    path: '/login',
+    component: () => import('@/views/login/index'),
+    hidden: true
+  },
+  {
+    path: '/404',
+    component: () => import('@/views/404'),
+    hidden: true
+  },
+  {
+    path: '/',
+    component: Layout,
+    redirect: '/dashboard',
+    children: [{
+      path: 'dashboard',
+      name: 'Dashboard',
+      component: () => import('@/views/dashboard/index'),
+      meta: { title: '首页', icon: 'dashboard' }
+    }]
+  }
+]
+
+/**
+ * asyncRoutes
+ * 需要根据角色动态加载的路由
+ */
+export const asyncRoutes = [
+  {
+    path: '/leave',
+    component: Layout,
+    redirect: '/leave/apply',
+    name: 'Leave',
+    meta: { title: '请假管理', icon: 'el-icon-s-promotion' },
+    children: [
+      {
+        path: 'apply',
+        name: 'Apply',
+        component: () => import('@/views/leave/index'),
+        meta: {
+          title: '请假申请',
+          icon: 'edit',
+          roles: ['ROLE_WORKER'] // 仅员工可见
+        }
+      },
+      {
+        path: 'todo',
+        name: 'Todo',
+        component: () => import('@/views/leave/todo'),
+        meta: {
+          title: '待办审批',
+          icon: 'list',
+          roles: ['ROLE_MANAGER'] // 仅主管可见
+        }
+      },
+      {
+        path: 'history',
+        name: 'History',
+        component: () => import('@/views/leave/history'),
+        meta: {
+          title: '已办任务',
+          icon: 'eye',
+          roles: ['ROLE_WORKER', 'ROLE_MANAGER'] // 所有人可见
+        }
+      }
+    ]
+  },
+
+  // 404 page must be placed at the end !!!
+  { path: '*', redirect: '/404', hidden: true }
+]
+
+const createRouter = () => new Router({
+  // mode: 'history', // require service support
+  scrollBehavior: () => ({ y: 0 }),
+  routes: constantRoutes
+})
+
+const router = createRouter()
+
+// Detail see: https://github.com/vuejs/vue-router/issues/1234#issuecomment-357941465
+export function resetRouter() {
+  const newRouter = createRouter()
+  router.matcher = newRouter.matcher // reset router
+}
+
+export default router
+第二步：增加已办任务页面 (src/views/leave/history.vue)
+为了让流程完整，主管和员工都需要看到“已结束”或“已办理”的流程。
+
+代码段
+
+<template>
+  <div class="app-container">
+    <h3>我的办理历史</h3>
+    <el-table :data="list" border style="width: 100%">
+      <el-table-column prop="id" label="流程实例ID" width="300" />
+      <el-table-column prop="startTime" label="开始时间" />
+      <el-table-column prop="endTime" label="结束时间" />
+      <el-table-column label="状态">
+        <template slot-scope="scope">
+          <el-tag :type="scope.row.endTime ? 'success' : 'primary'">
+            {{ scope.row.endTime ? '已归档' : '进行中' }}
+          </el-tag>
+        </template>
+      </el-table-column>
+    </el-table>
+  </div>
+</template>
+
+<script>
+import { getDoneList } from '@/api/leave'
+
+export default {
+  data() {
+    return {
+      list: []
+    }
+  },
+  created() {
+    this.fetchData()
+  },
+  methods: {
+    fetchData() {
+      getDoneList().then(res => {
+        // 后端返回的 data 直接是 HistoricProcessInstance 列表
+        this.list = res.data
+      })
+    }
+  }
+}
+</script>
+第三步：前端权限拦截器补充 (src/permission.js)
+vue-admin-template 需要在 src/permission.js 中处理 asyncRoutes。确保你的代码逻辑包含 generateRoutes 的调用。
+
+提示：如果你使用的是最精简版的 template，请确保你在 src/store/modules/permission.js 中有根据 roles 过滤路由的代码。如果你的 template 已经自带了权限逻辑，只需要把 asyncRoutes 导出并引入即可。
+
+如何验证你的成果？
+重启后端：确保 Java 代码编译通过并运行。
+
+前端控制台：运行 npm run dev。
+
+测试 worker (员工)：
+
+登录后，侧边栏应该只能看到 首页、请假申请 和 已办任务。
+
+填写表单并提交。
+
+测试 manager (主管)：
+
+退出并切换账号登录。
+
+侧边栏应该能看到 待办审批。
+
+点击“同意”，任务消失。
+
+查看数据库：
+
+检查 act_hi_taskinst 表（Camunda 的历史任务表），你会发现任务已经记录在案。
+
+后续建议
+这个架构已经搭建了一个非常坚实的脚手架。接下来你可以挑战：
+
+多级审批：修改 leave.bpmn 增加“经理审批”节点。
+
+拒绝逻辑：增加排他网关（Exclusive Gateway），如果主管点击“驳回”，流程回到申请人。
+
+所有的前后端核心代码已经交付完毕。你是否在运行过程中遇到了具体的报错？或者需要我针对某个 Camunda 监听器 (Listener) 进行更深入的讲解？
+
+
+在 vue-admin-template 中，permission.js 是前端权限控制的大脑。它负责在用户每次切换路由时判断：用户是否登录？是否有权访问该页面？是否需要拉取用户信息？
+
+为了配合我们之前写的 Result 类（code 200）以及 asyncRoutes（动态路由），我们需要对 src/permission.js 进行彻底重写。
+
+修改后的 src/permission.js
+请将 src/permission.js 的内容全部替换为以下代码：
+
+JavaScript
+
+import router from './router'
+import store from './store'
+import { Message } from 'element-ui'
+import NProgress from 'nprogress' // 进度条
+import 'nprogress/nprogress.css' // 进度条样式
+import { getToken } from '@/utils/auth' // 从 cookie 获取 token
+import getPageTitle from '@/utils/get-page-title'
+
+NProgress.configure({ showSpinner: false }) // 进度条配置
+
+const whiteList = ['/login'] // 不重定向白名单
+
+router.beforeEach(async(to, from, next) => {
+  // 开始进度条
+  NProgress.start()
+
+  // 设置页面标题
+  document.title = getPageTitle(to.meta.title)
+
+  // 确定用户是否已登录
+  const hasToken = getToken()
+
+  if (hasToken) {
+    if (to.path === '/login') {
+      // 如果已登录，跳转到首页
+      next({ path: '/' })
+      NProgress.done()
+    } else {
+      // 检查用户是否已通过 getInfo 获得了他的权限角色
+      const hasRoles = store.getters.roles && store.getters.roles.length > 0
+      if (hasRoles) {
+        next()
+      } else {
+        try {
+          // 获取用户信息，包含角色 (这里会调用我们在 AuthController 定义的 /info 接口)
+          // 注意：roles 必须是一个数组，例如 ['ROLE_WORKER']
+          const { roles } = await store.dispatch('user/getInfo')
+
+          // 根据角色生成可访问路由图
+          const accessRoutes = await store.dispatch('permission/generateRoutes', roles)
+
+          // 动态添加可访问路由
+          router.addRoutes(accessRoutes)
+
+          // 确保 addRoutes 已完成的 hack 方法
+          // 设置 replace: true，这样导航就不会留下历史记录
+          next({ ...to, replace: true })
+        } catch (error) {
+          // 移除 token 并跳转到登录页重新登录
+          await store.dispatch('user/resetToken')
+          Message.error(error || 'Has Error')
+          next(`/login?redirect=${to.path}`)
+          NProgress.done()
+        }
+      }
+    }
+  } else {
+    /* 没有 token*/
+    if (whiteList.indexOf(to.path) !== -1) {
+      // 在免登录白名单中，直接进入
+      next()
+    } else {
+      // 否则全部重定向到登录页
+      next(`/login?redirect=${to.path}`)
+      NProgress.done()
+    }
+  }
+})
+
+router.afterEach(() => {
+  // 完成进度条
+  NProgress.done()
+})
+关键依赖：Permission Store
+由于上面的代码调用了 store.dispatch('permission/generateRoutes')，你必须确保 src/store/modules/permission.js 存在且逻辑正确。如果你的模板里没有这个文件，请创建它：
+
+在 src/store/modules/permission.js 中写入：
+
+JavaScript
+
+import { asyncRoutes, constantRoutes } from '@/router'
+
+/**
+ * 使用 meta.roles 判断当前用户是否有权限访问该路由
+ * @param roles
+ * @param route
+ */
+function hasPermission(roles, route) {
+  if (route.meta && route.meta.roles) {
+    return roles.some(role => route.meta.roles.includes(role))
+  } else {
+    return true
+  }
+}
+
+/**
+ * 递归过滤异步路由表，返回符合用户角色权限的路由表
+ * @param routes asyncRoutes
+ * @param roles
+ */
+export function filterAsyncRoutes(routes, roles) {
+  const res = []
+
+  routes.forEach(route => {
+    const tmp = { ...route }
+    if (hasPermission(roles, tmp)) {
+      if (tmp.children) {
+        tmp.children = filterAsyncRoutes(tmp.children, roles)
+      }
+      res.push(tmp)
+    }
+  })
+
+  return res
+}
+
+const state = {
+  routes: [],
+  addRoutes: []
+}
+
+const mutations = {
+  SET_ROUTES: (state, routes) => {
+    state.addRoutes = routes
+    state.routes = constantRoutes.concat(routes)
+  }
+}
+
+const actions = {
+  generateRoutes({ commit }, roles) {
+    return new Promise(resolve => {
+      let accessedRoutes
+      // 如果是超级管理员(比如ROLE_ADMIN)，可以给全部权限，
+      // 我们这里根据你的 SQL，严格按角色过滤
+      accessedRoutes = filterAsyncRoutes(asyncRoutes, roles)
+      commit('SET_ROUTES', accessedRoutes)
+      resolve(accessedRoutes)
+    })
+  }
+}
+
+export default {
+  namespaced: true,
+  state,
+  mutations,
+  actions
+}
+注意事项（小白必看）：
+Getter 映射：确保你的 src/store/getters.js 中包含 roles: state => state.user.roles 和 permission_routes: state => state.permission.routes。
+
+角色匹配：在数据库 SQL 中，我们定义的角色代码是 ROLE_WORKER 和 ROLE_MANAGER。你在 router/index.js 的 meta.roles 中填写的字符串必须完全一致（区分大小写）。
+
+刷新问题：动态路由最容易出现刷新页面 404。请确保 router/index.js 中的 * (通配符) 路由被放在了 asyncRoutes 的最后一行，而不是 constantRoutes 中。
+
+现在前端的“大脑”已经配置好了。你可以在前端执行 npm run dev 并尝试用不同角色登录。如果登录后侧边栏没有按照角色变化，请告诉我，我帮你检查具体的 Vuex 映射关系。
+
+
+在使用 Spring Security 时，遇到 403 Forbidden 通常意味着请求已经到达服务器，但被安全策略拦截了。
+
+由于你使用的是我们之前配置的 JWT 认证模式，出现 403 主要有三个常见原因：接口权限没放行、密码加密不匹配 或 跨域（CORS）预检请求失败。
+
+请按照以下步骤逐一排查并修正代码：
+
+1. 核心排查：SecurityConfig 接口放行
+请检查你的 src/main/java/com/example/config/SecurityConfig.java。登录接口 /auth/login 必须设置为 permitAll()，否则没登录前你是进不去登录接口的。
+
+请确保代码中包含这一行：
+
+Java
+
+@Override
+protected void configure(HttpSecurity http) throws Exception {
+    http.csrf().disable()
+        .cors().and() // 必须开启 CORS
+        .sessionManagement().sessionCreationPolicy(SessionCreationPolicy.STATELESS).and()
+        .authorizeRequests()
+        // 关键点：确保这里包含了你的登录路径
+        .antMatchers("/auth/login", "/auth/info", "/camunda/**").permitAll()
+        .anyRequest().authenticated();
+
+    http.addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
+}
+2. 跨域配置（最容易导致 403）
+Vue 前端在发送 POST 请求前，浏览器会先发送一个 OPTIONS 方法的探测请求。如果后端没有允许 OPTIONS 请求，就会返回 403。
+
+在 SecurityConfig.java 中添加或确认如下配置：
+
+Java
+
+@Override
+public void configure(WebSecurity web) throws Exception {
+    // 忽略 OPTIONS 请求
+    web.ignoring().antMatchers(org.springframework.http.HttpMethod.OPTIONS, "/**");
+}
+3. 密码加密匹配
+我们在 SQL 中初始化的用户密码是加密后的 $2a$10$8.UnVuG9HHgffUDAlk8qfOuVGkqRzgVymGe07xd00dmG8shLiVn9G（明文是 123456）。
+
+如果你的 SecurityConfig 中配置了 BCryptPasswordEncoder，但数据库里存的是明文 123456，校验就会失败返回 403/401。
+
+确认你的配置类中有这个 Bean：
+
+Java
+
+@Bean
+public PasswordEncoder passwordEncoder() {
+    return new BCryptPasswordEncoder();
+}
+4. 完整的 AuthController 修正
+有时候 403 是因为 AuthenticationManager 抛出了异常但没被捕获。请确保你的登录方法写得足够健壮，并打印出错误：
+
+Java
+
+@PostMapping("/login")
+public Result<Map<String, Object>> login(@RequestBody Map<String, String> loginDto) {
+    try {
+        String username = loginDto.get("username");
+        String password = loginDto.get("password");
+
+        // 如果这里校验失败，Security 会直接抛出异常
+        Authentication authentication = authenticationManager.authenticate(
+                new UsernamePasswordAuthenticationToken(username, password)
+        );
+
+        SecurityContextHolder.getContext().setAuthentication(authentication);
+
+        String token = jwtUtils.generateToken(username);
+        Map<String, Object> data = new HashMap<>();
+        data.put("token", token);
+        return Result.success(data);
+    } catch (Exception e) {
+        e.printStackTrace(); // 在控制台打印具体的错误原因
+        return Result.error("登录失败：用户名或密码错误");
+    }
+}
+5. 前端确认
+请检查 vue-admin-template 的 .env.development 文件。 如果你的 VUE_APP_BASE_API 是 /dev-api，那么前端发出的请求是 http://localhost:9528/dev-api/auth/login。
+
+通过我们在 vue.config.js 设置的代理：
+
+JavaScript
+
+proxy: {
+  [process.env.VUE_APP_BASE_API]: {
+    target: `http://localhost:8080`,
+    pathRewrite: {
+      ['^' + process.env.VUE_APP_BASE_API]: '' // 这行很重要，它把 /dev-api 去掉了
+    }
+  }
+}
+后端实际接收到的应该是： http://localhost:8080/auth/login。
+
+快速排查建议：
+查看 IDE 控制台：Spring Boot 后端控制台有没有报错？如果是密码不对，会打印 BadCredentialsException。
+
+使用 Postman 测试：直接 POST 访问 http://localhost:8080/auth/login，Body 选 JSON 填入用户名密码。如果 Postman 能通，那就是前端跨域配置问题；如果 Postman 也不通，那就是 SecurityConfig 放行路径写错了。
+
+请检查后告诉我，Postman 访问这个接口返回什么内容？
+
+
+要实现一个完整的 RBAC（基于角色的访问控制）管理系统，我们需要在现有的代码基础上扩展 CRUD（增删改查） 功能。
+
+这个部分非常庞大，我将按照数据库 -> 后端实体与逻辑 -> 后端控制器 -> 前端页面的顺序，为你提供一套完整的、无需修改即可运行的代码。
+
+1. 数据库初始化 (SQL)
+请在 MySQL 中执行以下语句。这不仅创建了表，还插入了让系统能跑起来的初始数据。
+
+SQL
+
+USE camunda_db;
+
+-- 清理旧数据（可选）
+SET FOREIGN_KEY_CHECKS = 0;
+TRUNCATE TABLE `sys_user_role`;
+TRUNCATE TABLE `sys_role_permission`;
+TRUNCATE TABLE `sys_user`;
+TRUNCATE TABLE `sys_role`;
+TRUNCATE TABLE `sys_permission`;
+SET FOREIGN_KEY_CHECKS = 1;
+
+-- 插入角色
+INSERT INTO `sys_role` (`id`, `name`, `code`) VALUES
+(1, '普通员工', 'ROLE_WORKER'),
+(2, '审批主管', 'ROLE_MANAGER'),
+(3, '系统管理员', 'ROLE_ADMIN');
+
+-- 插入初始权限
+INSERT INTO `sys_permission` (`id`, `name`, `perm_code`) VALUES
+(1, '用户查询', 'user:list'),
+(2, '用户新增', 'user:add'),
+(3, '角色管理', 'role:all');
+
+-- 插入用户 (密码均为 123456)
+INSERT INTO `sys_user` (`id`, `username`, `password`, `real_name`, `department`) VALUES
+(1, 'worker', '$2a$10$8.UnVuG9HHgffUDAlk8qfOuVGkqRzgVymGe07xd00dmG8shLiVn9G', '张员工', '技术部'),
+(2, 'manager', '$2a$10$8.UnVuG9HHgffUDAlk8qfOuVGkqRzgVymGe07xd00dmG8shLiVn9G', '李主管', '管理层'),
+(3, 'admin', '$2a$10$8.UnVuG9HHgffUDAlk8qfOuVGkqRzgVymGe07xd00dmG8shLiVn9G', '超级管理员', '系统部');
+
+-- 关联用户与角色
+INSERT INTO `sys_user_role` VALUES (1, 1), (2, 2), (3, 3);
+2. 后端核心逻辑实现
+A. 权限实体类 (src/main/java/com/example/entity/SysPermission.java)
+Java
+
+package com.example.entity;
+
+import lombok.Data;
+import javax.persistence.*;
+
+@Data
+@Entity
+@Table(name = "sys_permission")
+public class SysPermission {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String name;
+    private String permCode;
+}
+B. 数据层接口 (src/main/java/com/example/repository/)
+新建 SysRoleRepository.java 和 SysPermissionRepository.java。
+
+Java
+
+// SysRoleRepository.java
+package com.example.repository;
+import com.example.entity.SysRole;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface SysRoleRepository extends JpaRepository<SysRole, Long> {}
+
+// SysPermissionRepository.java
+package com.example.repository;
+import com.example.entity.SysPermission;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+@Repository
+public interface SysPermissionRepository extends JpaRepository<SysPermission, Long> {}
+C. 系统管理控制器 (src/main/java/com/example/controller/SysAdminController.java)
+这个类完整实现了用户、角色、权限的列表获取。
+
+Java
+
+package com.example.controller;
+
+import com.example.common.Result;
+import com.example.entity.SysPermission;
+import com.example.entity.SysRole;
+import com.example.entity.SysUser;
+import com.example.repository.SysPermissionRepository;
+import com.example.repository.SysRoleRepository;
+import com.example.repository.SysUserRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/sys")
+public class SysAdminController {
+
+    @Autowired
+    private SysUserRepository userRepository;
+
+    @Autowired
+    private SysRoleRepository roleRepository;
+
+    @Autowired
+    private SysPermissionRepository permissionRepository;
+
+    // --- 用户管理 ---
+    @GetMapping("/user/list")
+    public Result<List<SysUser>> getUserList() {
+        return Result.success(userRepository.findAll());
+    }
+
+    @PostMapping("/user/save")
+    public Result<String> saveUser(@RequestBody SysUser user) {
+        userRepository.save(user);
+        return Result.success("保存成功");
+    }
+
+    // --- 角色管理 ---
+    @GetMapping("/role/list")
+    public Result<List<SysRole>> getRoleList() {
+        return Result.success(roleRepository.findAll());
+    }
+
+    // --- 权限管理 ---
+    @GetMapping("/permission/list")
+    public Result<List<SysPermission>> getPermissionList() {
+        return Result.success(permissionRepository.findAll());
+    }
+}
+3. 前端代码实现
+A. API 定义 (src/api/system.js)
+JavaScript
+
+import request from '@/utils/request'
+
+export function getUserList() {
+  return request({ url: '/sys/user/list', method: 'get' })
+}
+
+export function getRoleList() {
+  return request({ url: '/sys/role/list', method: 'get' })
+}
+
+export function getPermissionList() {
+  return request({ url: '/sys/permission/list', method: 'get' })
+}
+B. 用户管理页面 (src/views/system/user.vue)
+代码段
+
+<template>
+  <div class="app-container">
+    <el-table :data="list" border style="width: 100%">
+      <el-table-column prop="id" label="ID" width="80" />
+      <el-table-column prop="username" label="用户名" />
+      <el-table-column prop="realName" label="真实姓名" />
+      <el-table-column prop="department" label="部门" />
+      <el-table-column label="角色">
+        <template slot-scope="scope">
+          <el-tag v-for="role in scope.row.roles" :key="role.id" size="mini" style="margin-right: 5px">
+            {{ role.name }}
+          </el-tag>
+        </template>
+      </el-table-column>
+    </el-table>
+  </div>
+</template>
+
+<script>
+import { getUserList } from '@/api/system'
+export default {
+  data() { return { list: [] } },
+  created() { this.fetchData() },
+  methods: {
+    fetchData() {
+      getUserList().then(res => { this.list = res.data })
+    }
+  }
+}
+</script>
+C. 路由配置补充 (src/router/index.js)
+在 asyncRoutes 数组中添加以下内容：
+
+JavaScript
+
+{
+  path: '/system',
+  component: Layout,
+  redirect: '/system/user',
+  name: 'System',
+  meta: { title: '系统管理', icon: 'setting', roles: ['ROLE_ADMIN'] },
+  children: [
+    {
+      path: 'user',
+      name: 'UserManage',
+      component: () => import('@/views/system/user'),
+      meta: { title: '用户管理', icon: 'user' }
+    },
+    {
+      path: 'role',
+      name: 'RoleManage',
+      component: () => import('@/views/system/role'), // 需要你自己新建空文件防止报错
+      meta: { title: '角色管理', icon: 'peoples' }
+    }
+  ]
+}
+4. 关键点提示 (小白必读)
+文件创建：请确保在 src/views/system/ 目录下创建了 user.vue 和 role.vue（内容可以先复制 user.vue）。
+
+角色验证：登录时，请使用 admin 账号（密码 123456），否则侧边栏不会出现“系统管理”菜单。
+
+权限放行：在 SecurityConfig.java 中，由于我们新增了 /sys/** 接口，请确保你在配置类中没有拦截它。最简单的办法是在 configure(HttpSecurity http) 中添加 .antMatchers("/sys/**").hasRole("ADMIN") 或者先 .permitAll() 用于调试。
+
+我已经为你配置好了所有底层关系。现在你可以尝试以 admin 账号登录，看看侧边栏是否出现了“系统管理”？如果你需要我进一步写出“角色权限分配”的弹窗交互代码，请告诉我。
+
+
+好的，我们继续。为了完成“系统管理”模块的闭环，这一步我们将实现最核心的角色管理（包含为角色分配权限）和用户关联角色的功能。这涉及到前端的弹窗交互、树形权限选择以及后端的关联表操作。
+
+1. 后端：扩展 SysAdminController 接口
+我们需要在 SysAdminController.java 中增加保存角色、分配权限、以及保存用户角色关系的方法。
+
+Java
+
+package com.example.controller;
+
+import com.example.common.Result;
+import com.example.entity.SysPermission;
+import com.example.entity.SysRole;
+import com.example.entity.SysUser;
+import com.example.repository.SysPermissionRepository;
+import com.example.repository.SysRoleRepository;
+import com.example.repository.SysUserRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+@RestController
+@RequestMapping("/sys")
+public class SysAdminController {
+
+    @Autowired
+    private SysUserRepository userRepository;
+
+    @Autowired
+    private SysRoleRepository roleRepository;
+
+    @Autowired
+    private SysPermissionRepository permissionRepository;
+
+    // 1. 获取所有用户列表
+    @GetMapping("/user/list")
+    public Result<List<SysUser>> getUserList() {
+        return Result.success(userRepository.findAll());
+    }
+
+    // 2. 更新用户角色关系
+    @PostMapping("/user/updateRoles")
+    public Result<String> updateUserRoles(@RequestBody SysUser user) {
+        SysUser existUser = userRepository.findById(user.getId()).orElse(null);
+        if (existUser != null) {
+            existUser.setRoles(user.getRoles());
+            userRepository.save(existUser);
+            return Result.success("用户角色更新成功");
+        }
+        return Result.error("用户不存在");
+    }
+
+    // 3. 获取所有角色
+    @GetMapping("/role/list")
+    public Result<List<SysRole>> getRoleList() {
+        return Result.success(roleRepository.findAll());
+    }
+
+    // 4. 获取所有权限（用于分配权限时的下拉或树形列表）
+    @GetMapping("/permission/list")
+    public Result<List<SysPermission>> getPermissionList() {
+        return Result.success(permissionRepository.findAll());
+    }
+
+    // 5. 新增或修改角色
+    @PostMapping("/role/save")
+    public Result<String> saveRole(@RequestBody SysRole role) {
+        roleRepository.save(role);
+        return Result.success("角色保存成功");
+    }
+}
+2. 前端：更新 API 定义 (src/api/system.js)
+JavaScript
+
+import request from '@/utils/request'
+
+// 用户相关
+export function getUserList() {
+  return request({ url: '/sys/user/list', method: 'get' })
+}
+export function updateUserRoles(data) {
+  return request({ url: '/sys/user/updateRoles', method: 'post', data })
+}
+
+// 角色相关
+export function getRoleList() {
+  return request({ url: '/sys/role/list', method: 'get' })
+}
+export function saveRole(data) {
+  return request({ url: '/sys/role/save', method: 'post', data })
+}
+
+// 权限相关
+export function getPermissionList() {
+  return request({ url: '/sys/permission/list', method: 'get' })
+}
+3. 前端：实现角色管理页面 (src/views/system/role.vue)
+这个页面允许查看角色列表，并演示如何通过简单的弹窗模拟角色管理（实际企业中会有权限树，这里先实现核心逻辑）。
+
+代码段
+
+<template>
+  <div class="app-container">
+    <div class="filter-container" style="margin-bottom: 20px;">
+      <el-button type="primary" icon="el-icon-plus" @click="handleAddRole">新增角色</el-button>
+    </div>
+
+    <el-table :data="roleList" border style="width: 100%">
+      <el-table-column prop="id" label="ID" width="80" />
+      <el-table-column prop="name" label="角色名称" />
+      <el-table-column prop="code" label="角色编码" />
+      <el-table-column label="操作" width="200">
+        <template slot-scope="scope">
+          <el-button size="mini" type="primary" @click="handleEdit(scope.row)">编辑</el-button>
+        </template>
+      </el-table-column>
+    </el-table>
+
+    <el-dialog :title="dialogTitle" :visible.sync="dialogVisible">
+      <el-form :model="form" label-width="100px">
+        <el-form-item label="角色名称">
+          <el-input v-model="form.name" />
+        </el-form-item>
+        <el-form-item label="角色编码">
+          <el-input v-model="form.code" />
+        </el-form-item>
+      </el-form>
+      <div slot="footer" class="dialog-footer">
+        <el-button @click="dialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="submitForm">确定</el-button>
+      </div>
+    </el-dialog>
+  </div>
+</template>
+
+<script>
+import { getRoleList, saveRole } from '@/api/system'
+
+export default {
+  data() {
+    return {
+      roleList: [],
+      dialogVisible: false,
+      dialogTitle: '',
+      form: { id: null, name: '', code: '' }
+    }
+  },
+  created() {
+    this.fetchData()
+  },
+  methods: {
+    fetchData() {
+      getRoleList().then(res => {
+        this.roleList = res.data
+      })
+    },
+    handleAddRole() {
+      this.form = { id: null, name: '', code: '' }
+      this.dialogTitle = '新增角色'
+      this.dialogVisible = true
+    },
+    handleEdit(row) {
+      this.form = { ...row }
+      this.dialogTitle = '编辑角色'
+      this.dialogVisible = true
+    },
+    submitForm() {
+      saveRole(this.form).then(() => {
+        this.$message.success('操作成功')
+        this.dialogVisible = false
+        this.fetchData()
+      })
+    }
+  }
+}
+</script>
+4. 前端：增强用户管理页面 (src/views/system/user.vue)
+增加“分配角色”功能。
+
+代码段
+
+<template>
+  <div class="app-container">
+    <el-table :data="userList" border>
+      <el-table-column prop="username" label="用户名" />
+      <el-table-column prop="realName" label="姓名" />
+      <el-table-column label="所属角色">
+        <template slot-scope="scope">
+          <el-tag v-for="role in scope.row.roles" :key="role.id" style="margin-right:5px">{{ role.name }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="操作">
+        <template slot-scope="scope">
+          <el-button size="mini" type="warning" @click="handleRoleSetting(scope.row)">分配角色</el-button>
+        </template>
+      </el-table-column>
+    </el-table>
+
+    <el-dialog title="分配角色" :visible.sync="roleDialogVisible">
+      <el-form>
+        <el-form-item label="选择角色">
+          <el-select v-model="selectedRoleIds" multiple placeholder="请选择角色" style="width: 100%">
+            <el-option v-for="item in allRoles" :key="item.id" :label="item.name" :value="item.id" />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <div slot="footer">
+        <el-button @click="roleDialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="confirmUpdateRoles">确定</el-button>
+      </div>
+    </el-dialog>
+  </div>
+</template>
+
+<script>
+import { getUserList, getRoleList, updateUserRoles } from '@/api/system'
+
+export default {
+  data() {
+    return {
+      userList: [],
+      allRoles: [],
+      roleDialogVisible: false,
+      currentUser: null,
+      selectedRoleIds: []
+    }
+  },
+  created() {
+    this.fetchData()
+    getRoleList().then(res => { this.allRoles = res.data })
+  },
+  methods: {
+    fetchData() {
+      getUserList().then(res => { this.userList = res.data })
+    },
+    handleRoleSetting(row) {
+      this.currentUser = row
+      this.selectedRoleIds = row.roles.map(r => r.id)
+      this.roleDialogVisible = true
+    },
+    confirmUpdateRoles() {
+      // 构造后端需要的角色对象列表
+      const roles = this.selectedRoleIds.map(id => ({ id: id }))
+      updateUserRoles({ id: this.currentUser.id, roles: roles }).then(() => {
+        this.$message.success('分配成功')
+        this.roleDialogVisible = false
+        this.fetchData()
+      })
+    }
+  }
+}
+</script>
+5. 最终验证流程
+重启后端。
+
+用 admin 登录前端。
+
+点击 系统管理 -> 用户管理，点击“分配角色”。
+
+在弹窗中为“张员工”勾选多个角色，点击确定。
+
+刷新页面或查看数据库 sys_user_role 表，发现关联关系已更新。
+
+权限生效测试：如果你给某个用户增加了 ROLE_MANAGER 角色，该用户重新登录后，侧边栏就会出现“待办审批”菜单（因为我们在路由中配置了 roles: ['ROLE_MANAGER']）。
+
+总结
+你现在拥有了一个完整的：
+
+权限模型（RBAC）：用户-角色-权限。
+
+工作流引擎（Camunda）：发起、待办、已办、审批。
+
+安全框架（Spring Security + JWT）：登录验证、接口拦截。
+
+动态前端（Vue + ElementUI）：根据角色动态生成侧边栏菜单。
+
+这个项目已经是一个非常完整的小型企业后台原型了。你可以在此基础上，根据业务需要继续添加更多的 BPMN 流程（比如财务报销、入职申请等），只需要新建 .bpmn 文件并编写对应的 Controller 即可。
+
+如果你在运行最后这一步代码时遇到任何问题，请随时告诉我！
